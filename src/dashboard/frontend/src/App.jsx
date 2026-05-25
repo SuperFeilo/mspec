@@ -7,6 +7,8 @@ import ProjectSessions from './pages/ProjectSessions'
 import ProjectMemory from './pages/ProjectMemory'
 import ProjectGit from './pages/ProjectGit'
 import ProjectContext from './pages/ProjectContext'
+import ProjectArchitecture from './pages/ProjectArchitecture'
+import ProjectBuildPlan from './pages/ProjectBuildPlan'
 import Activity from './pages/Activity'
 import Settings from './pages/Settings'
 
@@ -21,6 +23,8 @@ function App() {
         <Route path="project/:projectId/memory" element={<ProjectMemory />} />
         <Route path="project/:projectId/git" element={<ProjectGit />} />
         <Route path="project/:projectId/context" element={<ProjectContext />} />
+        <Route path="project/:projectId/architecture" element={<ProjectArchitecture />} />
+        <Route path="project/:projectId/build-plan" element={<ProjectBuildPlan />} />
         <Route path="activity" element={<Activity />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />

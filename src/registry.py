@@ -141,6 +141,18 @@ def get_project_sessions(project_id: str):
     return [dict(r) for r in rows]
 
 
+def delete_project_record(project_id: str) -> bool:
+    """Remove a project and its sessions/agent_calls from the registry."""
+    conn = get_connection()
+    conn.execute("DELETE FROM agent_calls WHERE project_id = ?", (project_id,))
+    conn.execute("DELETE FROM sessions WHERE project_id = ?", (project_id,))
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    deleted = conn.total_changes > 0
+    conn.close()
+    return deleted
+
+
 def get_agent_stats(project_id: str, session_id: str | None = None):
     conn = get_connection()
     if session_id:
