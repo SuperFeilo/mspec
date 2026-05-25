@@ -1,0 +1,144 @@
+# MSpec — Spec-Driven Local Harness
+
+**MSpec** is a spec-driven, multi-agent coding harness that runs entirely locally. Write a spec, and a team of LLM agents (via [LM Studio](https://lmstudio.ai/)) plans, builds, evaluates, and checkpoints a full project — all with git-backed session history and semantic memory.
+
+Think of it as an **open-source, self-hosted agentic coding pipeline** — Planner → Builder → Evaluator → QA — orchestrated through a structured loop.
+
+---
+
+## Prerequisites
+
+- **Python 3.10+**
+- **[LM Studio](https://lmstudio.ai/)** running locally with models loaded:
+  - `qwen3.6-27b` or similar for Builder / Compactor
+  - `qwen3.6-35b-a3b` or similar for Planner / Evaluator
+  - `text-embedding-nomic-embed-text-v1.5` for embeddings
+- **[opencode](https://github.com/superfunc/opencode)** installed for code generation (Builder agent)
+- **Git** (for project versioning)
+
+---
+
+## Quick Start
+
+```bash
+# Install
+pip install -r requirements.txt
+
+# Or install as a package
+pip install -e .
+
+# Initialize a new project
+harness init my-project --spec path/to/spec.md
+
+# Generate the implementation plan
+harness plan my-project
+
+# Run all phases (Planner → Builder → Evaluator loop)
+harness run my-project
+
+# Checkpoint progress (summarize + git commit + tag)
+harness checkpoint my-project
+
+# Resume from last checkpoint
+harness resume my-project
+
+# View project status
+harness status
+
+# Launch the dashboard
+harness dashboard
+```
+
+---
+
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `harness init <name> [--spec file.md]` | Scaffold a new project |
+| `harness plan <name>` | Generate `plan.md` from spec |
+| `harness run <name> [phase]` | Execute phase(s) with agent loop |
+| `harness checkpoint <name>` | Compact session + git commit + tag |
+| `harness resume <name> [--from tag]` | Restore context from checkpoint |
+| `harness status` | Terminal table of all projects |
+| `harness dashboard [--port 8765]` | Start the React dashboard |
+| `harness spec <name> [show\|edit]` | View or edit project spec |
+| `harness agent list\|set` | View or change agent→model mapping |
+
+---
+
+## Architecture
+
+```
+                    ┌──────────┐
+                    │   CLI    │
+                    └────┬─────┘
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+   ┌─────────┐    ┌──────────┐    ┌──────────────┐
+   │  Agent   │    │  Memory  │    │  Dashboard   │
+   │  Router  │    │  Manager │    │  FastAPI +   │
+   └────┬─────┘    └──────────┘    │  React SPA   │
+        │                          └──────────────┘
+   ┌────┴──────────────────────┐
+   │  Planner → Builder →      │
+   │  Evaluator → QA (loop)    │
+   └───────────────────────────┘
+```
+
+### Agent Roles
+
+| Agent     | Model                    | How                  | Purpose                         |
+|-----------|--------------------------|----------------------|---------------------------------|
+| Planner   | qwen3.6-35b-a3b          | Direct LM Studio     | Break spec → phases → tasks     |
+| Builder   | qwen3.6-27b              | `opencode run`       | Write code                      |
+| Evaluator | qwen3.6-35b-a3b          | Direct LM Studio     | Review output, verify correctness |
+| QA        | qwen3.6-27b              | Direct LM Studio     | Suggest test commands           |
+| Compactor | qwen3.6-27b              | Direct LM Studio     | Session summarization           |
+| Embedder  | nomic-embed-text-v1.5    | LM Studio embed API  | Semantic memory search          |
+
+---
+
+## Project Structure
+
+```
+~/harness-projects/<name>/
+├── .harness/
+│   ├── spec.md              # Source of truth
+│   ├── memory.json          # Decisions, architecture, task states
+│   ├── plan.md              # Generated implementation plan
+│   ├── context.log          # Raw session log
+│   └── sessions/            # Compacted session summaries
+├── src/                     # Generated code
+└── .git/
+```
+
+---
+
+## Configuration
+
+Edit `src/config.yaml` or use the dashboard Settings page:
+
+- **`llm.base_url`** — LM Studio endpoint (default: `http://127.0.0.1:1234/v1`)
+- **`agents.<name>.model`** — Per-agent model override
+- **`agents.<name>.context_length`** — Max tokens per agent
+- **`projects_dir`** — Where scaffolded projects live (default: `~/harness-projects`)
+- **`global.max_retries`** — Builder retry attempts on evaluation failure
+
+---
+
+## Development
+
+```bash
+# Clone + install
+git clone https://github.com/SuperFeilo/mspec.git
+cd mspec
+pip install -e .
+
+# Run tests
+pytest
+
+# Start dashboard
+harness dashboard
+```

@@ -1,0 +1,19 @@
+{
+  "project": "mspec-harness",
+  "spec_version": "1",
+  "tech_stack": {
+    "cli": "Python (typer + rich)",
+    "llm": "LM Studio (qwen3.6-27b, qwen3.6-35b-a3b)",
+    "code_agent": "opencode",
+    "registry": "SQLite",
+    "dashboard": "FastAPI + React + Tailwind + shadcn/ui"
+  },
+  "decisions": [],
+  "architecture": {
+    "layers": ["CLI", "Agent Router", "Executor", "Memory", "Git", "Dashboard"],
+    "services": ["LM Studio", "opencode", "SQLite", "FastAPI"]
+  },
+  "tasks": [],
+  "session_count": 0,
+  "last_session": null
+}
