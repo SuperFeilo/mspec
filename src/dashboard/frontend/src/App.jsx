@@ -9,6 +9,7 @@ import ProjectGit from './pages/ProjectGit'
 import ProjectContext from './pages/ProjectContext'
 import ProjectArchitecture from './pages/ProjectArchitecture'
 import ProjectBuildPlan from './pages/ProjectBuildPlan'
+import ProjectAnalytics from './pages/ProjectAnalytics'
 import Activity from './pages/Activity'
 import Settings from './pages/Settings'
 
@@ -25,6 +26,7 @@ function App() {
         <Route path="project/:projectId/context" element={<ProjectContext />} />
         <Route path="project/:projectId/architecture" element={<ProjectArchitecture />} />
         <Route path="project/:projectId/build-plan" element={<ProjectBuildPlan />} />
+        <Route path="project/:projectId/analytics" element={<ProjectAnalytics />} />
         <Route path="activity" element={<Activity />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />

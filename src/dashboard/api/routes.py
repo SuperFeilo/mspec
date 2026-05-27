@@ -22,6 +22,17 @@ from registry import (
     update_project_status,
     add_session,
     delete_project_record,
+    create_run,
+    update_run_status as db_update_run_status,
+    add_run_event,
+    get_run,
+    list_runs as db_list_runs,
+    get_latest_run_for_step,
+    upsert_build_steps,
+    get_build_steps,
+    update_build_step_status,
+    link_build_step_to_run,
+    get_dashboard_summary,
 )
 from config import load_config, CONFIG_PATH, HARNESS_DIR
 from memory.manager import MemoryManager
@@ -117,6 +128,34 @@ def get_project_memory(project_id: str):
 def get_project_sessions_list(project_id: str):
     _ensure_db()
     sessions = get_project_sessions(project_id)
+
+    # Also fetch coding run failures as sessions
+    project = get_project(project_id)
+    if project:
+        import json as _jr
+        runs_dir = Path(project["path"]) / ".harness" / "runs"
+        if runs_dir.exists():
+            for f in sorted(runs_dir.glob("*.json"), reverse=True):
+                if f.name == "active.json":
+                    continue
+                try:
+                    run = _jr.loads(f.read_text(encoding="utf-8"))
+                    if run.get("status") == "failed":
+                        # Check if already in sessions
+                        session_id = run.get("session_id", f"run_{run['id']}")
+                        if not any(s["id"] == session_id for s in sessions):
+                            sessions.insert(0, {
+                                "id": session_id,
+                                "project_id": project_id,
+                                "tag": f"failed:{run.get('stub_name', '?')}",
+                                "summary": f"Coding run failed: {run.get('stub_name', '?')} with {run.get('agent', '?')} — {run.get('events', [{}])[-1].get('message', 'process terminated')}",
+                                "created_at": run.get("end_time") or run.get("start_time"),
+                                "duration_seconds": None,
+                                "run_id": run["id"],
+                                "run_status": "failed",
+                            })
+                except Exception:
+                    pass
     return {"sessions": sessions}
 
 
@@ -172,11 +211,54 @@ def get_activity():
     projects = get_all_projects()
     total_sessions = sum(p.get("session_count", 0) for p in projects)
     running = sum(1 for p in projects if p.get("status") == "running")
+
+    # Gather coding run stats across all projects
+    import json as _jr
+    total_runs = 0
+    running_runs = 0
+    completed_runs = 0
+    failed_runs = 0
+    project_runs = {}
+
+    for p in projects:
+        runs_dir = Path(p["path"]) / ".harness" / "runs"
+        p_runs = []
+        if runs_dir.exists():
+            for f in runs_dir.glob("*.json"):
+                if f.name == "active.json":
+                    continue
+                try:
+                    run = _jr.loads(f.read_text(encoding="utf-8"))
+                    total_runs += 1
+                    if run["status"] in ("starting", "running"):
+                        running_runs += 1
+                    elif run["status"] == "completed":
+                        completed_runs += 1
+                    elif run["status"] == "failed":
+                        failed_runs += 1
+                    p_runs.append({
+                        "id": run["id"],
+                        "stub_name": run["stub_name"],
+                        "agent": run["agent"],
+                        "status": run["status"],
+                        "start_time": run["start_time"],
+                    })
+                except Exception:
+                    pass
+        project_runs[p["id"]] = p_runs[:5]  # latest 5
+
     return {
         "total_projects": len(projects),
         "total_sessions": total_sessions,
         "running_projects": running,
+        "coding_runs": {
+            "total": total_runs,
+            "running": running_runs,
+            "completed": completed_runs,
+            "failed": failed_runs,
+        },
         "projects": projects,
+        "project_runs": project_runs,
     }
 
 
@@ -2051,6 +2133,10 @@ def _generate_build_plan(project_name: str, mspec_content: str, tech_stack: dict
         # Estimate tokens (rough: ~4 chars per token)
         estimated_tokens = max(500, len(context) // 4 + 500)
 
+        # Build dependency list - only include steps that are also in the filtered list
+        all_possible_deps = [bs["id"] for bs in base_steps[:base_steps.index(s)]]
+        existing_ids = [st["id"] for st in steps]
+        valid_deps = [d for d in all_possible_deps if d in existing_ids]
         steps.append({
             "id": s["id"],
             "title": s["title"],
@@ -2059,7 +2145,7 @@ def _generate_build_plan(project_name: str, mspec_content: str, tech_stack: dict
             "contract": s["contract"],
             "tests": s["tests"],
             "status": "pending",
-            "dependencies": [bs["id"] for bs in base_steps[:base_steps.index(s)]],
+            "dependencies": valid_deps,
         })
 
     return steps
@@ -2164,6 +2250,12 @@ def generate_build_plan(project_id: str):
     build_steps_path = harness_dir / "build-steps.json"
     build_steps_path.write_text(json.dumps(steps, indent=2), encoding="utf-8")
 
+    # Also write to SQLite registry
+    try:
+        upsert_build_steps(project_id, steps)
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "total_steps": len(steps),
@@ -2181,6 +2273,15 @@ def get_build_plan(project_id: str):
     if not project:
         raise HTTPException(404, "Project not found")
 
+    # Try DB first — includes FK links to runs
+    try:
+        result = get_build_steps(project_id)
+        if result["exists"]:
+            return result
+    except Exception:
+        pass
+
+    # Fallback: read from JSON file, auto-migrate to DB
     project_path = Path(project["path"])
     steps_path = project_path / ".harness" / "build-steps.json"
 
@@ -2195,6 +2296,12 @@ def get_build_plan(project_id: str):
         }
 
     steps = json.loads(steps_path.read_text(encoding="utf-8"))
+    # Auto-migrate to DB and link runs
+    try:
+        upsert_build_steps(project_id, steps)
+        _auto_link_migrated_runs(project_id, project_path)
+    except Exception:
+        pass
     done = sum(1 for s in steps if s["status"] == "done")
     in_progress = sum(1 for s in steps if s["status"] == "in_progress")
 
@@ -2218,7 +2325,7 @@ def update_build_step(project_id: str, step_id: str, status: str = Body(..., emb
     if not project:
         raise HTTPException(404, "Project not found")
 
-    if status not in ("not_started", "in_progress", "tested", "ready_for_merge", "merged", "pending", "done"):
+    if status not in ("not_started", "in_progress", "tested", "ready_for_merge", "merged", "pending", "done", "completed", "failed"):
         raise HTTPException(400, "Invalid status")
 
     project_path = Path(project["path"])
@@ -2239,6 +2346,12 @@ def update_build_step(project_id: str, step_id: str, status: str = Body(..., emb
         raise HTTPException(404, f"Step '{step_id}' not found in build plan.")
 
     steps_path.write_text(json.dumps(steps, indent=2), encoding="utf-8")
+
+    # Also sync to DB registry
+    try:
+        update_build_step_status(project_id, step_id, status)
+    except Exception:
+        pass
 
     # Also update build-plan.md status
     md_path = project_path / ".harness" / "build-plan.md"
@@ -2618,11 +2731,202 @@ def generate_stub_files(project_id: str):
             "tokens": len(stub_content) // 4,  # rough estimate
         })
 
+    # ── Validate stubs for completeness and integration ──
+    validation = _validate_stubs(generated, steps, tech_stack, project_path)
+
     return {
         "ok": True,
         "count": len(generated),
         "stubs": generated,
         "directory": str(steps_dir),
+        "validation": validation,
+    }
+
+
+def _validate_stubs(stubs: list, steps: list, tech_stack: dict, project_path=None) -> dict:
+    """Validate each stub for completeness and cross-stub integration."""
+    required_sections = ["Context", "Contract", "Implementation Checklist", "Test Scenarios", "End-to-End Test"]
+    section_keywords = {
+        "Context": ["context", "tech stack", "architecture"],
+        "Contract": ["inputs", "outputs"],
+        "Implementation Checklist": ["[ ]"],
+        "Test Scenarios": ["unit test", "integration test", "test"],
+        "End-to-End Test": ["scenario", "steps"],
+    }
+
+    ts_text = " ".join(str(v).lower() for v in tech_stack.values() if v)
+    is_python = any(kw in ts_text for kw in ["python", "fastapi", "flask"])
+    is_frontend = any(kw in ts_text for kw in ["react", "vue", "svelte"])
+
+    results = []
+    all_checks_passed = True
+    total_checks = 0
+    passed_checks = 0
+
+    for stub_info in stubs:
+        stub_rel = stub_info["path"]
+        stub_path = project_path / stub_rel if project_path else Path(stub_rel)
+        if not stub_path.exists():
+            results.append({
+                "stub": stub_info["id"],
+                "title": stub_info["title"],
+                "passed": False,
+                "score": 0,
+                "checks": [{"name": "File exists", "passed": False, "detail": f"File not found: {stub_rel}"}],
+            })
+            all_checks_passed = False
+            continue
+
+        content = stub_path.read_text(encoding="utf-8")
+        checks = []
+        cl = content.lower()
+
+        # Check 1: Has context with tech stack
+        has_context = all(kw in cl for kw in ["context", "tech"])
+        checks.append({
+            "name": "Context includes tech stack",
+            "passed": has_context,
+            "detail": "Contains tech stack reference" if has_context else "Missing tech stack in context",
+        })
+        total_checks += 1
+        if has_context: passed_checks += 1
+
+        # Check 2: Has contract with inputs/outputs
+        has_contract = "input" in cl and "output" in cl
+        checks.append({
+            "name": "Contract defines inputs and outputs",
+            "passed": has_contract,
+            "detail": "Inputs and outputs defined" if has_contract else "Missing inputs or outputs",
+        })
+        total_checks += 1
+        if has_contract: passed_checks += 1
+
+        # Check 3: Has implementation checklist
+        has_checklist = "[ ]" in content or "- [ ]" in content
+        checks.append({
+            "name": "Implementation checklist present",
+            "passed": has_checklist,
+            "detail": f"Found {content.count('[ ]')} checklist items" if has_checklist else "No checklist items",
+        })
+        total_checks += 1
+        if has_checklist: passed_checks += 1
+
+        # Check 4: Has test scenarios
+        has_tests = "test" in cl and ("unit" in cl or "integration" in cl)
+        checks.append({
+            "name": "Test scenarios defined",
+            "passed": has_tests,
+            "detail": "Unit/integration tests included" if has_tests else "Missing test scenarios",
+        })
+        total_checks += 1
+        if has_tests: passed_checks += 1
+
+        # Check 5: Has e2e test
+        has_e2e = "end-to-end" in cl or "e2e" in cl or "scenario" in cl
+        checks.append({
+            "name": "End-to-end test scenario",
+            "passed": has_e2e,
+            "detail": "E2E scenario defined" if has_e2e else "Missing e2e test",
+        })
+        total_checks += 1
+        if has_e2e: passed_checks += 1
+
+        # Check 6: Has coding architecture / patterns
+        has_patterns = "pattern" in cl or "architecture" in cl or "structure" in cl
+        checks.append({
+            "name": "Coding architecture / patterns",
+            "passed": has_patterns,
+            "detail": "Architecture patterns documented" if has_patterns else "No architecture patterns",
+        })
+        total_checks += 1
+        if has_patterns: passed_checks += 1
+
+        # Check 7: Has files to create/modify
+        has_files = "file" in cl or "create" in cl or "modify" in cl
+        checks.append({
+            "name": "Files to create/modify listed",
+            "passed": has_files,
+            "detail": "Files referenced" if has_files else "No file references",
+        })
+        total_checks += 1
+        if has_files: passed_checks += 1
+
+        stub_pass = all(c["passed"] for c in checks)
+        if not stub_pass:
+            all_checks_passed = False
+
+        results.append({
+            "stub": stub_info["id"],
+            "title": stub_info["title"],
+            "passed": stub_pass,
+            "checks": checks,
+            "score": round(sum(1 for c in checks if c["passed"]) / len(checks) * 100),
+        })
+
+    # ── Cross-stub integration check ──
+    integration_checks = []
+    step_ids = [s["id"] for s in steps]
+    step_map = {s["id"]: s for s in steps}
+
+    # Check dependency chain is consistent
+    for i, s in enumerate(steps):
+        deps = s.get("dependencies", [])
+        for d in deps:
+            if d not in step_ids:
+                # Dependency may have been intentionally filtered (e.g., auth for small projects)
+                integration_checks.append({
+                    "check": f"{s['id']} depends on {d}",
+                    "passed": True,
+                    "detail": f"Dependency '{d}' not in plan (filtered) — OK",
+                })
+            else:
+                dep_idx = step_ids.index(d)
+                if dep_idx >= i:
+                    integration_checks.append({
+                        "check": f"{s['id']} depends on {d}",
+                        "passed": False,
+                        "detail": f"Dependency order wrong: {d} appears after {s['id']}",
+                    })
+                    all_checks_passed = False
+                else:
+                    integration_checks.append({
+                        "check": f"{s['id']} ← depends on {d}",
+                        "passed": True,
+                        "detail": "Dependency order correct",
+                    })
+        # Don't double-count passed_checks for dependencies; already counted in stub checks
+
+    # Check tech stack consistency across stubs
+    for stub_info in stubs:
+        stub_rel = stub_info["path"]
+        stub_path = project_path / stub_rel if project_path else Path(stub_rel)
+        if stub_path.exists():
+            content = stub_path.read_text(encoding="utf-8")
+            cl = content.lower()
+            # Python projects should reference python in context
+            if is_python and "python" not in cl:
+                integration_checks.append({
+                    "check": f"{stub_info['id']}: tech stack alignment",
+                    "passed": False,
+                    "detail": "Python project but stub doesn't reference Python",
+                })
+                all_checks_passed = False
+            elif is_python:
+                integration_checks.append({
+                    "check": f"{stub_info['id']}: tech stack alignment",
+                    "passed": True,
+                    "detail": "Tech stack consistent",
+                })
+
+    return {
+        "stub_checks": results,
+        "integration_checks": integration_checks,
+        "summary": {
+            "all_passed": all_checks_passed,
+            "total_checks": total_checks,
+            "passed_checks": passed_checks,
+            "score": round(passed_checks / total_checks * 100) if total_checks > 0 else 0,
+        },
     }
 
 
@@ -2649,6 +2953,1281 @@ def list_stub_files(project_id: str):
         })
 
     return {"exists": True, "stubs": stubs}
+
+
+# ─── Code Script Generator ─────────────────────────────────────
+
+CODE_AGENTS = {
+    "opencode": {
+        "label": "opencode",
+        "cmd_template": 'opencode --model "{model}" --prompt "{prompt_file}" --output-dir "{output_dir}"',
+        "description": "Open-source code generation agent with file creation and editing capabilities.",
+    },
+    "reasonix": {
+        "label": "reasonix code",
+        "cmd_template": 'reasonix code --model "{model}" "{prompt_file}"',
+        "description": "Agentic coding assistant with plan-execute loop and file system access.",
+    },
+}
+
+
+@router.post("/api/projects/{project_id}/build-plan/code-scripts")
+def generate_code_scripts(project_id: str, agent: str = "opencode"):
+    """Generate runnable code scripts for each stub file using opencode/reasonix."""
+    import json, shlex
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    if agent not in CODE_AGENTS:
+        raise HTTPException(400, f"Unknown agent '{agent}'. Choose: {', '.join(CODE_AGENTS.keys())}")
+
+    project_path = Path(project["path"])
+    steps_dir = project_path / ".harness" / "steps"
+    scripts_dir = project_path / ".harness" / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    if not steps_dir.exists():
+        raise HTTPException(400, "No stub files found. Generate Build Plan and Stub Files first.")
+
+    # Get LLM provider config for model selection
+    from config import load_provider_config
+    provider_cfg = load_provider_config()
+    provider = provider_cfg.get("provider", "localllm")
+    if provider == "deepseek":
+        model = provider_cfg.get("deepseek", {}).get("model", "deepseek-chat")
+    else:
+        model = provider_cfg.get("localllm", {}).get("model", "qwen3.6-27b")
+
+    agent_info = CODE_AGENTS[agent]
+    scripts = []
+
+    for stub_file in sorted(steps_dir.glob("BP-*.md")):
+        stub_name = stub_file.stem  # e.g., "BP-01-scaffold"
+        stub_id = stub_name[:6]     # e.g., "BP-01"
+
+        # Relative path to stub file from project root
+        stub_rel = stub_file.relative_to(project_path)
+
+        # Build the command
+        cmd = agent_info["cmd_template"].format(
+            model=model,
+            prompt_file=str(stub_rel),
+            output_dir="src",
+        )
+
+        # Create .bat file for Windows
+        bat_path = scripts_dir / f"{stub_name}.bat"
+        status_file = f".harness\\scripts\\{stub_name}.status"
+        # Read stub content to build a self-contained prompt
+        stub_content = stub_file.read_text(encoding="utf-8", errors="replace")
+        prompt_path = scripts_dir / f"{stub_name}.prompt.md"
+        prompt_path.write_text(stub_content, encoding="utf-8")
+
+        # Build command — for reasonix, create a REASONIX.md in project root
+        # that reasonix auto-loads, then launch it without pipe
+        if agent == "reasonix":
+            # Read stub content and pass as inline prompt argument
+            # Truncate to 2000 chars to fit command-line limits
+            inline_prompt = stub_content[:2000].replace('"', "'").replace('\n', ' ').replace('\r', ' ')
+            run_cmd = f'reasonix code --model "{model}" "{inline_prompt}"'
+        else:
+            run_cmd = cmd
+
+        prompt_rel = prompt_path.relative_to(project_path)
+        bat_lines = [
+            "@echo off",
+            f"title Coding: {stub_name}",
+            f"cd /d \"{project_path}\"",
+            "",
+            f"echo === {agent_info['label']} Coding Session ===",
+            f"echo Stub: {stub_name}",
+            f"echo Model: {model}",
+            f"echo Injecting task context at runtime...",
+            "echo.",
+            run_cmd,
+            "set EXIT_CODE=%ERRORLEVEL%",
+            f"echo %EXIT_CODE% > \"{status_file}\"",
+            "echo.",
+            "if %EXIT_CODE% NEQ 0 (",
+            f"    echo {agent_info['label']} exited with code %EXIT_CODE%",
+            "    pause",
+            ") else (",
+            "    echo Coding complete!",
+            "    timeout /t 3 >nul",
+            ")",
+        ]
+        bat_path.write_text("\n".join(bat_lines), encoding="utf-8")
+
+        # Create .sh file for Unix
+        sh_path = scripts_dir / f"{stub_name}.sh"
+        sh_lines = [
+            "#!/bin/bash",
+            f"# Coding script for {stub_name}",
+            f"cd \"{project_path}\"",
+            "echo \"========================================\"",
+            f"echo \"  {agent_info['label']} — {stub_name}\"",
+            "echo \"========================================\"",
+            "echo \"",
+            f"echo \"  Stub: {stub_name}\"",
+            f"echo \"  Model: {model}\"",
+            "echo \"  Agent reads stub autonomously.\"",
+            "echo \"",
+            cmd,
+            'if [ $? -eq 0 ]; then',
+            '    echo "✓ Coding complete!"',
+            'else',
+            '    echo "✗ Coding failed!"',
+            '    exit 1',
+            'fi',
+        ]
+        sh_path.write_text("\n".join(sh_lines), encoding="utf-8")
+
+        scripts.append({
+            "id": stub_id,
+            "name": stub_name,
+            "title": stub_name[6:].replace("-", " ").title(),
+            "command": cmd,
+            "script_bat": str(bat_path.relative_to(project_path)),
+            "script_sh": str(sh_path.relative_to(project_path)),
+            "prompt_file": str(stub_rel),
+            "model": model,
+        })
+
+    return {
+        "ok": True,
+        "agent": agent,
+        "agent_label": agent_info["label"],
+        "agent_description": agent_info["description"],
+        "count": len(scripts),
+        "scripts": scripts,
+        "directory": str(scripts_dir),
+    }
+
+
+@router.get("/api/projects/{project_id}/build-plan/code-scripts")
+def list_code_scripts(project_id: str):
+    """List generated code scripts."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    scripts_dir = Path(project["path"]) / ".harness" / "scripts"
+    if not scripts_dir.exists():
+        return {"exists": False, "scripts": []}
+
+    scripts = []
+    for f in sorted(scripts_dir.glob("*.bat")):
+        content = f.read_text(encoding="utf-8")
+        # Extract command from the .bat file (first non-comment, non-cd line)
+        cmd_line = ""
+        for line in content.split("\n"):
+            line = line.strip()
+            if line and not line.startswith("@") and not line.startswith("title") and not line.startswith("cd") and not line.startswith("echo") and not line.startswith("if") and not line.startswith(")") and not line.startswith("pause"):
+                cmd_line = line
+                break
+        scripts.append({
+            "name": f.stem,
+            "path": str(f.relative_to(Path(project["path"]))),
+            "command": cmd_line,
+        })
+
+    return {"exists": True, "scripts": scripts}
+
+
+# ─── Run Tracking System ────────────────────────────────────────
+
+import uuid as _uuid
+import datetime as _dt
+import json as _json
+
+
+def _get_runs_dir(project_path: Path) -> Path:
+    d = project_path / ".harness" / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _create_run(project_path: Path, stub_name: str, agent: str, model: str) -> dict:
+    runs_dir = _get_runs_dir(project_path)
+    run_id = str(_uuid.uuid4())[:8]
+    session_id = f"run_{run_id}_{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    run = {
+        "id": run_id,
+        "session_id": session_id,
+        "stub_name": stub_name,
+        "agent": agent,
+        "model": model,
+        "status": "starting",
+        "start_time": now,
+        "end_time": None,
+        "events": [
+            {"timestamp": now, "level": "info", "message": f"Run created for {stub_name} with {agent}", "context": {"agent": agent, "model": model}},
+        ],
+        "error": None,
+    }
+    run_path = runs_dir / f"{run_id}.json"
+    run_path.write_text(_json.dumps(run, indent=2))
+    return run
+
+
+def _log_event(project_path: Path, run_id: str, level: str, message: str, context: dict = None):
+    runs_dir = _get_runs_dir(project_path)
+    run_path = runs_dir / f"{run_id}.json"
+    if not run_path.exists():
+        return
+    run = _json.loads(run_path.read_text(encoding="utf-8"))
+    run["events"].append({
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "level": level,
+        "message": message,
+        "context": context or {},
+    })
+    run_path.write_text(_json.dumps(run, indent=2))
+
+
+def _update_run_status(project_path: Path, run_id: str, status: str, error: str = None):
+    runs_dir = _get_runs_dir(project_path)
+    run_path = runs_dir / f"{run_id}.json"
+    if not run_path.exists():
+        return
+    run = _json.loads(run_path.read_text(encoding="utf-8"))
+    run["status"] = status
+    if status in ("completed", "failed"):
+        run["end_time"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    if error:
+        run["error"] = error
+    run_path.write_text(_json.dumps(run, indent=2))
+
+
+@router.get("/api/projects/{project_id}/build-plan/runs")
+def list_runs(project_id: str):
+    """List all tracked runs with counts."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Use DB as primary source
+    result = db_list_runs(project_id)
+
+    # Always import new JSON-only runs that aren't in the DB yet
+    runs_dir = _get_runs_dir(Path(project["path"]))
+    if runs_dir.exists():
+        db_ids = {r["id"] for r in result.get("runs", [])}
+        import json as _j
+        for f in sorted(runs_dir.glob("*.json"), reverse=True):
+            if f.name == "active.json":
+                continue
+            rid = f.stem
+            if rid in db_ids:
+                continue  # already in DB
+            try:
+                run = _j.loads(f.read_text(encoding="utf-8"))
+                events = run.pop("events", [])
+                run.pop("files_changed", None)
+                create_run(
+                    project_id=project_id,
+                    run_id=run["id"],
+                    session_id=run.get("session_id", f"run_{run['id']}"),
+                    stub_name=run.get("stub_name", ""),
+                    agent=run.get("agent", "unknown"),
+                    model=run.get("model", ""),
+                    stub_path=run.get("stub_path"),
+                    bp_id=run.get("bp_id"),
+                    title=run.get("title"),
+                )
+                db_update_run_status(
+                    run["id"], run.get("status", "completed"),
+                    error=run.get("error"),
+                    exit_code=run.get("exit_code"),
+                )
+                for ev in events:
+                    add_run_event(run["id"], ev.get("level", "info"),
+                                  ev.get("message", ""),
+                                  _j.dumps(ev.get("context", {})) if ev.get("context") else None)
+            except Exception:
+                pass
+
+    # Re-query with new imports
+    result = db_list_runs(project_id)
+    if result["total"] > 0:
+        return result
+
+    # Fallback: empty result — no runs at all
+    runs_dir = _get_runs_dir(Path(project["path"]))
+    if runs_dir.exists():
+        import json as _j
+        for f in sorted(runs_dir.glob("*.json"), reverse=True):
+            if f.name == "active.json":
+                continue
+            try:
+                run = _j.loads(f.read_text(encoding="utf-8"))
+                events = run.pop("events", [])
+                run.pop("files_changed", None)
+                create_run(
+                    project_id=project_id,
+                    run_id=run["id"],
+                    session_id=run.get("session_id", f"run_{run['id']}"),
+                    stub_name=run.get("stub_name", ""),
+                    agent=run.get("agent", "unknown"),
+                    model=run.get("model", ""),
+                    stub_path=run.get("stub_path"),
+                    bp_id=run.get("bp_id"),
+                    title=run.get("title"),
+                )
+                db_update_run_status(
+                    run["id"], run.get("status", "completed"),
+                    error=run.get("error"),
+                    exit_code=run.get("exit_code"),
+                )
+                for ev in events:
+                    add_run_event(run["id"], ev.get("level", "info"),
+                                  ev.get("message", ""),
+                                  _j.dumps(ev.get("context", {})) if ev.get("context") else None)
+            except Exception:
+                pass
+
+    # After migration, try to auto-link runs to build steps
+    try:
+        _auto_link_migrated_runs(project_id, Path(project["path"]))
+    except Exception:
+        pass
+
+    return db_list_runs(project_id)
+
+
+@router.get("/api/projects/{project_id}/build-plan/runs/{run_id}")
+def get_run_detail(project_id: str, run_id: str):
+    """Get full run detail including all events."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Try DB first
+    run = get_run(run_id)
+    if run:
+        return run
+
+    # Fallback: read from JSON
+    runs_dir = _get_runs_dir(Path(project["path"]))
+    run_path = runs_dir / f"{run_id}.json"
+    if not run_path.exists():
+        raise HTTPException(404, f"Run '{run_id}' not found")
+
+    return _json.loads(run_path.read_text(encoding="utf-8"))
+
+
+@router.post("/api/projects/{project_id}/build-plan/start-run")
+def start_tracked_run(project_id: str, stub_name: str = Body(...), agent: str = Body("opencode")):
+    """Start a tracked coding run for a stub. Opens terminal and logs events."""
+    import subprocess, platform
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    scripts_dir = project_path / ".harness" / "scripts"
+
+    # Resolve model from provider config
+    from config import load_provider_config
+    provider_cfg = load_provider_config()
+    provider = provider_cfg.get("provider", "localllm")
+    if provider == "deepseek":
+        model = provider_cfg.get("deepseek", {}).get("model", "deepseek-chat")
+    else:
+        model = provider_cfg.get("localllm", {}).get("model", "qwen3.6-27b")
+
+    # Create run record
+    run = _create_run(project_path, stub_name, agent, model)
+    _update_run_status(project_path, run["id"], "running")
+
+    # Find the script
+    script_path = scripts_dir / f"{stub_name}.bat"
+    if not script_path.exists():
+        script_path = scripts_dir / f"{stub_name}.sh"
+    if not script_path.exists():
+        _update_run_status(project_path, run["id"], "failed", error=f"Script '{stub_name}' not found")
+        raise HTTPException(404, f"Script '{stub_name}' not found. Generate code scripts first.")
+
+    try:
+        if platform.system() == "Windows":
+            CREATE_NEW_CONSOLE = 0x00000010
+            # Terminal stays open for visibility; watcher reads .status file for exit code
+            proc = subprocess.Popen(
+                ["cmd", "/k", str(script_path)],
+                creationflags=CREATE_NEW_CONSOLE,
+                cwd=str(project_path),
+            )
+            _log_event(project_path, run["id"], "info", f"Terminal opened (PID: {proc.pid})", {"pid": proc.pid})
+
+            # Store active PID
+            active_path = _get_runs_dir(project_path) / "active.json"
+            active = {}
+            if active_path.exists():
+                active = _json.loads(active_path.read_text(encoding="utf-8"))
+            active[run["id"]] = {"pid": proc.pid, "stub_name": stub_name, "start_time": run["start_time"]}
+            active_path.write_text(_json.dumps(active, indent=2))
+
+            return {
+                "ok": True,
+                "run": run,
+                "pid": proc.pid,
+            }
+        else:
+            proc = subprocess.Popen(
+                ["x-terminal-emulator", "-e", f"bash {script_path}"],
+                cwd=str(project_path),
+            )
+            _log_event(project_path, run["id"], "info", f"Terminal opened (PID: {proc.pid})", {"pid": proc.pid})
+            return {
+                "ok": True,
+                "run": run,
+                "pid": proc.pid,
+            }
+    except Exception as e:
+        _update_run_status(project_path, run["id"], "failed", error=str(e))
+        _log_event(project_path, run["id"], "error", f"Failed to launch: {str(e)}")
+        raise HTTPException(500, f"Failed to launch: {str(e)}")
+
+
+@router.post("/api/projects/{project_id}/build-plan/runs/{run_id}/log")
+def log_run_event(project_id: str, run_id: str, level: str = Body(...), message: str = Body(...), context: dict = Body({})):
+    """Append a log event to a run."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    _log_event(Path(project["path"]), run_id, level, message, context)
+    return {"ok": True}
+
+
+@router.post("/api/projects/{project_id}/build-plan/runs/{run_id}/resume")
+def resume_run(project_id: str, run_id: str, debug_model: str = Body("deepseek-v4-pro")):
+    """Resume a run with a debugger model for troubleshooting."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    runs_dir = _get_runs_dir(project_path)
+    run_path = runs_dir / f"{run_id}.json"
+
+    if not run_path.exists():
+        raise HTTPException(404, f"Run '{run_id}' not found")
+
+    original = _json.loads(run_path.read_text(encoding="utf-8"))
+    stub_name = original["stub_name"]
+    agent = original["agent"]
+
+    # Create a new run linked to original session
+    run = _create_run(project_path, stub_name, agent, debug_model)
+    run["resumed_from"] = run_id
+    run["original_session"] = original["session_id"]
+    _update_run_status(project_path, run["id"], "running")
+
+    _log_event(project_path, run["id"], "info", f"Resumed from run {run_id} with debugger model {debug_model}",
+               {"original_run": run_id, "debug_model": debug_model})
+    _log_event(project_path, run_id, "info", f"Debugger session started: run {run['id']} with {debug_model}",
+               {"resume_run": run["id"]})
+
+    # Generate debug script with the new model
+    scripts_dir = project_path / ".harness" / "scripts"
+    debug_script_name = f"{stub_name}_debug"
+    debug_bat = scripts_dir / f"{debug_script_name}.bat"
+    debug_prompt = scripts_dir / f"{stub_name}.prompt.md"
+    debug_cmd = f'type "{debug_prompt.relative_to(project_path)}" | reasonix code --model "{debug_model}"' if agent == "reasonix" else f'opencode --model "{debug_model}" --prompt ".harness\\steps\\{stub_name}.md" --output-dir "src"'
+    debug_bat_lines = [
+        "@echo off",
+        f"title Debug: {stub_name} ({debug_model})",
+        f"cd /d \"{project_path}\"",
+        "",
+        f"echo === DEBUG SESSION for {stub_name} ===",
+        f"echo Using debugger model: {debug_model}",
+        f"echo Resumed from run: {run_id}",
+        "echo.",
+        debug_cmd,
+        "echo.",
+        "if errorlevel 1 (",
+        "    echo Debug session failed",
+        "    pause",
+        ") else (",
+        "    echo Debug session complete!",
+        "    pause",
+        ")",
+    ]
+    debug_bat.write_text("\n".join(debug_bat_lines), encoding="utf-8")
+
+    import subprocess, platform
+    try:
+        if platform.system() == "Windows":
+            CREATE_NEW_CONSOLE = 0x00000010
+            proc = subprocess.Popen(
+                ["cmd", "/k", str(debug_bat)],
+                creationflags=CREATE_NEW_CONSOLE,
+                cwd=str(project_path),
+            )
+            _log_event(project_path, run["id"], "info", f"Debug terminal opened (PID: {proc.pid})", {"pid": proc.pid})
+        else:
+            proc = subprocess.Popen(
+                ["x-terminal-emulator", "-e", f"bash {debug_bat}"],
+                cwd=str(project_path),
+            )
+    except Exception as e:
+        _update_run_status(project_path, run["id"], "failed", error=str(e))
+        raise HTTPException(500, f"Failed to launch debugger: {str(e)}")
+
+    return {
+        "ok": True,
+        "run": run,
+        "debug_model": debug_model,
+    }
+
+
+# ─── Blueprint Stubs Endpoint ──────────────────────────────────
+
+
+@router.get("/api/blueprints")
+def list_blueprint_stubs(project_id: str | None = None):
+    """List available blueprint stub files.
+
+    When project_id is provided, loads stubs from the project's
+    .harness/stubs/ directory, auto-seeding from the mspec blueprint
+    stubs if empty. Otherwise falls back to src/stubs/.
+    """
+    from stubs.runner import list_stubs as _list_mspec_stubs
+
+    if project_id:
+        project = get_project(project_id)
+        if project:
+            project_path = Path(project["path"])
+            stubs_dir = project_path / ".harness" / "stubs"
+
+            # Auto-seed: if project has no blueprints, copy from mspec
+            if not stubs_dir.exists() or not list(stubs_dir.glob("*.md")):
+                stubs_dir.mkdir(parents=True, exist_ok=True)
+                mspec_stubs = _list_mspec_stubs()
+                for s in mspec_stubs:
+                    src = Path(__file__).parent.parent.parent.parent / s["path"]
+                    if src.exists():
+                        dst = stubs_dir / src.name
+                        dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+            # Merge stubs from .harness/stubs/ (blueprints) + .harness/steps/ (generated build steps)
+            seen = set()
+            stubs = []
+            for subdir in ["stubs", "steps"]:
+                dir_path = project_path / ".harness" / subdir
+                if dir_path.exists():
+                    for f in sorted(dir_path.glob("*.md")):
+                        stem_lower = f.stem.lower()
+                        if stem_lower in seen:
+                            continue
+                        seen.add(stem_lower)
+                        stubs.append({
+                            "path": str(f.relative_to(project_path)),
+                            "bp": f.stem[:5],
+                            "name": f.stem,
+                            "title": f.stem.replace("-", " ").title(),
+                            "init": False,
+                            "source": subdir,
+                        })
+            return {"stubs": stubs, "total": len(stubs), "source": "project"}
+        return {"stubs": [], "total": 0, "source": "project"}
+
+    # Fallback: load from mspec src/stubs/
+    from stubs.runner import list_stubs
+    stubs = list_stubs()
+    return {"stubs": stubs, "total": len(stubs), "source": "mspec"}
+
+
+@router.get("/api/stubs/{name}/validate")
+def validate_blueprint_stub(name: str):
+    """Validate a blueprint stub for Reasonix actionability.
+
+    Returns a score, pass/fail per check, and recommendations.
+    """
+    from stubs.validate import pressure_test_stub
+    try:
+        result = pressure_test_stub(name)
+        return result
+    except Exception as e:
+        return {"name": name, "valid": False, "score": 0,
+                "summary": f"Validation error: {str(e)}",
+                "checks": [], "execution_check": None,
+                "recommendation": "Fix stub file before running"}
+
+
+@router.post("/api/stubs/validate-all")
+def validate_all_blueprint_stubs():
+    """Validate all blueprint stubs for Reasonix actionability."""
+    from stubs.validate import validate_all_stubs
+    try:
+        results = validate_all_stubs()
+        return {"stubs": results, "total": len(results),
+                "pass_count": sum(1 for r in results if r["valid"])}
+    except Exception as e:
+        raise HTTPException(500, f"Validation error: {str(e)}")
+
+
+# ─── Reasonix Run Endpoints ────────────────────────────────────
+
+_reasonix_manager_cache = {}
+
+
+def _get_reasonix_manager(project_path: Path):
+    """Get or create ReasonixRunManager for the project."""
+    key = str(project_path)
+    if key not in _reasonix_manager_cache:
+        from dashboard.api.reasonix_runner import ReasonixRunManager
+        _reasonix_manager_cache[key] = ReasonixRunManager(project_path)
+    return _reasonix_manager_cache[key]
+
+
+@router.post("/api/projects/{project_id}/reasonix-run")
+def start_reasonix_run(project_id: str, data: dict = Body(...)):
+    """Start a Reasonix stub run in background.
+
+    Reads the stub .md file, passes it to `reasonix run`, and tracks
+    the process with periodic polling and code preservation.
+
+    Accepts:
+        {"stub_path": "BP-01-scaffold.md"}  — name or path to stub file
+
+    Returns a run_id that can be polled via GET .../reasonix-run/{run_id}.
+    """
+    stub_path_raw = data.get("stub_path", "")
+    if not stub_path_raw:
+        raise HTTPException(400, "stub_path is required")
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    manager = _get_reasonix_manager(project_path)
+
+    # Resolve stub path — try multiple strategies:
+    stub = Path(stub_path_raw).expanduser()
+    if not stub.exists():
+        mspec_stubs_dir = Path(__file__).parent.parent.parent / "stubs"
+
+        # Strategy 1: Direct filename match in MSpec stubs dir
+        for candidate in [stub_path_raw, stub_path_raw + ".md"]:
+            p = mspec_stubs_dir / candidate
+            if p.exists():
+                stub = p
+                break
+        else:
+            # Strategy 2: Search by name field in frontmatter
+            from stubs.runner import parse_stub
+            for f in mspec_stubs_dir.glob("*.md"):
+                if f.name == "TEMPLATE.md":
+                    continue
+                try:
+                    parsed = parse_stub(f)
+                    fm = parsed["frontmatter"]
+                    if fm.get("name") == stub_path_raw or fm.get("bp", "").lower() == stub_path_raw.lower():
+                        stub = f
+                        break
+                except Exception:
+                    continue
+            else:
+                # Strategy 3: Project steps dir (generated build plan stubs)
+                for ext in ["", ".md"]:
+                    p = project_path / ".harness" / "steps" / (stub_path_raw + ext)
+                    if p.exists():
+                        stub = p
+                        break
+                else:
+                    # Strategy 4: Project scripts dir
+                    for ext in ["", ".bat", ".sh", ".md"]:
+                        p = project_path / ".harness" / "scripts" / (stub_path_raw + ext)
+                        if p.exists():
+                            stub = p
+                            break
+                    else:
+                        raise HTTPException(404, f"Stub file not found: {stub_path_raw}")
+
+    try:
+        run = manager.start_run(stub)
+        if run["status"] == "failed":
+            return {"ok": False, "error": run.get("error", "Failed to start"), "run": run}
+        return {"ok": True, "run": run}
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start Reasonix run: {str(e)}")
+
+
+@router.get("/api/projects/{project_id}/reasonix-run/{run_id}")
+def get_reasonix_run(project_id: str, run_id: str):
+    """Get the current status of a Reasonix run."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    manager = _get_reasonix_manager(project_path)
+
+    run = manager.get_run(run_id)
+    if not run:
+        raise HTTPException(404, f"Run '{run_id}' not found")
+
+    return run
+
+
+@router.post("/api/projects/{project_id}/reasonix-run/{run_id}/poll")
+def poll_reasonix_run(project_id: str, run_id: str):
+    """Poll a Reasonix run's status (called every 3 min by the dashboard)."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    manager = _get_reasonix_manager(project_path)
+
+    run = manager.poll_run(run_id)
+    if not run:
+        raise HTTPException(404, f"Run '{run_id}' not found")
+
+    return run
+
+
+@router.get("/api/projects/{project_id}/reasonix-runs")
+def list_reasonix_runs(project_id: str):
+    """List all Reasonix runs for a project."""
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    manager = _get_reasonix_manager(project_path)
+
+    runs = manager.list_runs()
+    total = len(runs)
+    running = sum(1 for r in runs if r.get("status") in ("starting", "running"))
+    completed = sum(1 for r in runs if r.get("status") == "completed")
+    failed = sum(1 for r in runs if r.get("status") == "failed")
+
+    return {
+        "total": total,
+        "running": running,
+        "completed": completed,
+        "failed": failed,
+        "runs": runs[:20],  # latest 20
+    }
+
+
+@router.post("/api/projects/{project_id}/build-plan/watch-runs")
+def watch_runs(project_id: str):
+    """Check if active runs are still alive. Update failed ones and log to sessions."""
+    import subprocess as _sp, platform as _pf
+    from registry import add_session
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    runs_dir = _get_runs_dir(project_path)
+    active_path = runs_dir / "active.json"
+
+    if not active_path.exists():
+        return {"checked": 0, "failed": 0, "updated": []}
+
+    active = _json.loads(active_path.read_text(encoding="utf-8"))
+    updated = []
+    failed_count = 0
+    to_remove = []
+
+    for run_id, info in list(active.items()):
+        pid = info.get("pid")
+        if not pid:
+            continue
+
+        is_alive = False
+        exit_code = None
+        try:
+            if _pf.system() == "Windows":
+                result = _sp.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=5)
+                is_alive = str(pid) in result.stdout
+            else:
+                os.kill(pid, 0)
+                is_alive = True
+        except Exception:
+            is_alive = False
+
+        # Also check status file for exit code
+        exit_code = None
+        status_file = runs_dir.parent / "scripts" / f"{info.get('stub_name', run_id)}.status"
+        if status_file.exists():
+            try:
+                exit_code = int(status_file.read_text(encoding="utf-8").strip())
+            except:
+                pass
+
+        if not is_alive or (exit_code is not None and exit_code != 0):
+            run_path = runs_dir / f"{run_id}.json"
+            if run_path.exists():
+                try:
+                    run = _json.loads(run_path.read_text(encoding="utf-8"))
+                    was_running = run["status"] in ("starting", "running")
+                    if was_running or (exit_code is not None and exit_code != 0):
+                        run["status"] = "failed"
+                        run["end_time"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                        reason = f"exit code {exit_code}" if exit_code is not None else f"process {pid} terminated"
+                        err_msg = f"Run failed ({reason})"
+                        run["events"].append({
+                            "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                            "level": "error",
+                            "message": err_msg,
+                            "context": {"pid": pid, "exit_code": exit_code, "stub": run.get("stub_name")},
+                        })
+                        run_path.write_text(_json.dumps(run, indent=2))
+
+                        # Log to sessions registry
+                        try:
+                            session_id = run.get("session_id", f"run_{run_id}")
+                            summary = f"Coding run failed: {run.get('stub_name', '?')} with {run.get('agent', '?')} — process terminated"
+                            add_session(project_id, session_id, f"failed:{run_id}", summary)
+                        except Exception:
+                            pass
+
+                        updated.append({"id": run_id, "status": "failed", "message": err_msg})
+                        failed_count += 1
+                except Exception:
+                    pass
+            to_remove.append(run_id)
+
+    for rid in to_remove:
+        del active[rid]
+    active_path.write_text(_json.dumps(active, indent=2))
+
+    return {
+        "checked": len(list(active.values())) + len(to_remove),
+        "failed": failed_count,
+        "updated": updated,
+    }
+
+
+@router.post("/api/projects/{project_id}/build-plan/check-runs")
+def check_runs(project_id: str):
+    """Monitor all runs for stalls, completions, and save logs.
+
+    Scans every run JSON in .harness/runs/ and:
+    1. Stall detection — running >10min with no new events in 3min → kill + fail
+    2. Completion detection — exit code 0 → completed, non-zero → failed
+    3. Log saving — persist events + output to run-<id>.log
+
+    Called periodically by the frontend (e.g. every 30s).
+    """
+    import subprocess as _sp, platform as _pf
+    from registry import add_session
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    runs_dir = _get_runs_dir(project_path)
+    active_path = runs_dir / "active.json"
+
+    STALL_TIMEOUT_SEC = 600   # 10 min total wall time before stall declared
+    STALL_GRACE_SEC = 180     # 3 min without new events
+
+    # Load active PIDs
+    active = {}
+    if active_path.exists():
+        active = _json.loads(active_path.read_text(encoding="utf-8"))
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    results = {
+        "checked": 0,
+        "completed": 0,
+        "failed": 0,
+        "stalled": 0,
+        "terminated": 0,
+        "updated": [],
+    }
+
+    # Scan all run JSONs
+    for f in sorted(runs_dir.glob("*.json"), reverse=True):
+        if f.name == "active.json":
+            continue
+        try:
+            run = _json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        run_id = run.get("id", f.stem)
+        status = run.get("status", "unknown")
+
+        if status not in ("starting", "running"):
+            continue
+
+        results["checked"] += 1
+        changed = False
+        pid = active.get(run_id, {}).get("pid")
+
+        # ─── Check for exit code (completion detection) ───
+        exit_code = run.get("exit_code")
+
+        # Also check status file
+        if exit_code is None:
+            stub_name = run.get("stub_name", run_id)
+            status_file = runs_dir.parent / "scripts" / f"{stub_name}.status"
+            if status_file.exists():
+                try:
+                    exit_code = int(status_file.read_text(encoding="utf-8").strip())
+                except Exception:
+                    pass
+
+        # Fallback: parse exit code from last event text (e.g. "Reasonix process exited (code: 0)")
+        if exit_code is None:
+            events = run.get("events", [])
+            if events:
+                import re as _re
+                for ev in reversed(events):
+                    m = _re.search(r"exited\s*\(code:\s*(-?\d+)", ev.get("message", ""))
+                    if m:
+                        exit_code = int(m.group(1))
+                        run["exit_code"] = exit_code
+                        break
+
+        # Check if process is still alive
+        is_alive = False
+        if pid:
+            try:
+                if _pf.system() == "Windows":
+                    r = _sp.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=5)
+                    is_alive = str(pid) in r.stdout
+                else:
+                    os.kill(pid, 0)
+                    is_alive = True
+            except Exception:
+                is_alive = False
+
+        # ─── Completion: exit code available → mark completed or failed ───
+        if exit_code is not None:
+            if exit_code == 0:
+                run["status"] = "completed"
+                run["end_time"] = now.isoformat()
+                _log_event(project_path, run_id, "info",
+                    f"Run completed (exit code 0)", {"exit_code": 0})
+                results["completed"] += 1
+                results["updated"].append({"id": run_id, "status": "completed"})
+                _save_run_log(runs_dir, run)
+                _sync_run_to_build_step(project_path, run, "completed")
+                db_update_run_status(run_id, "completed", exit_code=exit_code)
+                changed = True
+            else:
+                run["status"] = "failed"
+                run["end_time"] = now.isoformat()
+                run["error"] = f"Exit code {exit_code}"
+                _log_event(project_path, run_id, "error",
+                    f"Run failed (exit code {exit_code})", {"exit_code": exit_code})
+                results["failed"] += 1
+                results["updated"].append({"id": run_id, "status": "failed", "error": run["error"]})
+                _save_run_log(runs_dir, run)
+                _sync_run_to_build_step(project_path, run, "failed")
+                db_update_run_status(run_id, "failed", error=run["error"], exit_code=exit_code)
+                changed = True
+
+            # Log session to registry
+            if changed:
+                try:
+                    session_id = run.get("session_id", f"run_{run_id}")
+                    summary = f"Coding run {'completed' if exit_code == 0 else 'failed'}: {run.get('stub_name', '?')} (exit {exit_code})"
+                    add_session(project_id, session_id, f"{'completed' if exit_code == 0 else 'failed'}:{run_id}", summary)
+                except Exception:
+                    pass
+
+        # ─── Stall detection: no exit code, process alive but idle ───
+        elif is_alive and not exit_code:
+            start_time_str = run.get("start_time")
+            if start_time_str:
+                try:
+                    start_time = _dt.datetime.fromisoformat(start_time_str)
+                    elapsed = (now - start_time).total_seconds()
+
+                    if elapsed > STALL_TIMEOUT_SEC:
+                        # Check when the last event was logged
+                        events = run.get("events", [])
+                        last_event_time = start_time
+                        if events:
+                            try:
+                                last_ts = events[-1].get("timestamp", start_time_str)
+                                last_event_time = _dt.datetime.fromisoformat(last_ts)
+                            except Exception:
+                                pass
+                        idle_sec = (now - last_event_time).total_seconds()
+
+                        if idle_sec > STALL_GRACE_SEC:
+                            # Kill the process
+                            try:
+                                if _pf.system() == "Windows":
+                                    _sp.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
+                                else:
+                                    os.kill(pid, 9)
+                            except Exception:
+                                pass
+
+                            run["status"] = "failed"
+                            run["end_time"] = now.isoformat()
+                            run["error"] = f"Stalled: {int(elapsed)}s elapsed, {int(idle_sec)}s idle"
+                            _log_event(project_path, run_id, "error",
+                                f"Run terminated — stalled {int(idle_sec)}s without progress (total {int(elapsed)}s)",
+                                {"elapsed_sec": int(elapsed), "idle_sec": int(idle_sec), "pid": pid})
+                            results["stalled"] += 1
+                            results["terminated"] += 1
+                            results["updated"].append({"id": run_id, "status": "failed", "error": run["error"]})
+                            _save_run_log(runs_dir, run)
+                            _sync_run_to_build_step(project_path, run, "failed")
+                            db_update_run_status(run_id, "failed", error=run["error"])
+                            changed = True
+
+                            try:
+                                session_id = run.get("session_id", f"run_{run_id}")
+                                summary = f"Run stalled and terminated: {run.get('stub_name', '?')} ({int(elapsed)}s)"
+                                add_session(project_id, session_id, f"stalled:{run_id}", summary)
+                            except Exception:
+                                pass
+
+                            # Remove from active
+                            active.pop(run_id, None)
+
+                except Exception:
+                    pass
+
+        # ─── Untracked run timeout (no PID, running too long) ───
+        elif not pid and not exit_code:
+            start_time_str = run.get("start_time")
+            if start_time_str:
+                try:
+                    start_time = _dt.datetime.fromisoformat(start_time_str)
+                    elapsed = (now - start_time).total_seconds()
+                    if elapsed > STALL_TIMEOUT_SEC:
+                        # No PID and running for too long — assume orphaned/dead
+                        run["status"] = "failed"
+                        run["end_time"] = now.isoformat()
+                        run["error"] = f"Abandoned: {int(elapsed)}s running without PID tracking"
+                        _log_event(project_path, run_id, "error",
+                            f"Run abandoned — no PID, running for {int(elapsed)}s",
+                            {"elapsed_sec": int(elapsed)})
+                        results["failed"] += 1
+                        results["stalled"] += 1
+                        results["updated"].append({"id": run_id, "status": "failed", "error": run["error"]})
+                        _save_run_log(runs_dir, run)
+                        _sync_run_to_build_step(project_path, run, "failed")
+                        db_update_run_status(run_id, "failed", error=run["error"])
+                        changed = True
+
+                        try:
+                            session_id = run.get("session_id", f"run_{run_id}")
+                            summary = f"Run abandoned (no PID, {int(elapsed)}s): {run.get('stub_name', '?')}"
+                            add_session(project_id, session_id, f"abandoned:{run_id}", summary)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # ─── Dead process (no exit code, not alive) → mark failed ───
+        elif not is_alive and not exit_code and pid:
+            run["status"] = "failed"
+            run["end_time"] = now.isoformat()
+            run["error"] = f"Process {pid} terminated unexpectedly"
+            _log_event(project_path, run_id, "error",
+                f"Process {pid} died unexpectedly", {"pid": pid})
+            results["failed"] += 1
+            results["updated"].append({"id": run_id, "status": "failed", "error": run["error"]})
+            _save_run_log(runs_dir, run)
+            _sync_run_to_build_step(project_path, run, "failed")
+            db_update_run_status(run_id, "failed", error=run["error"])
+            changed = True
+
+            try:
+                session_id = run.get("session_id", f"run_{run_id}")
+                summary = f"Run process died: {run.get('stub_name', '?')} (PID {pid})"
+                add_session(project_id, session_id, f"failed:{run_id}", summary)
+            except Exception:
+                pass
+
+            active.pop(run_id, None)
+
+        # Persist updated run JSON
+        if changed:
+            f.write_text(_json.dumps(run, indent=2))
+
+    # Persist updated active.json
+    active_path.write_text(_json.dumps(active, indent=2))
+
+    return results
+
+
+def _auto_link_migrated_runs(project_id: str, project_path: Path):
+    """One-time: link all migrated runs to their corresponding build steps via FK."""
+    import re as _re
+    try:
+        runs_result = db_list_runs(project_id)
+        all_runs = runs_result.get("runs", [])
+        if not all_runs:
+            return
+        # Get latest run per stub (highest priority: completed > running > failed)
+        best_per_stub = {}
+        for r in all_runs:
+            stub = r.get("stub_name", "")
+            if not stub:
+                continue
+            step_hint = _re.sub(r"^BP-\d+-", "", stub, flags=_re.IGNORECASE).lower()
+            step_hint = step_hint.replace("_", "").replace("-", "")
+            if not step_hint:
+                continue
+            priority = {"completed": 3, "running": 2, "starting": 2, "failed": 1}
+            existing = best_per_stub.get(step_hint)
+            if not existing or priority.get(r["status"], 0) > priority.get(existing["status"], 0):
+                best_per_stub[step_hint] = r
+
+        # Try to match each to a build step and set FK
+        steps_path = project_path / ".harness" / "build-steps.json"
+        if not steps_path.exists():
+            return
+        steps = _json.loads(steps_path.read_text(encoding="utf-8"))
+        for step in steps:
+            step_key = step["id"].lower().replace("_", "").replace("-", "")
+            for hint, run in best_per_stub.items():
+                if hint in step_key or step_key in hint:
+                    link_build_step_to_run(project_id, step["id"], run["id"])
+                    # Also sync status
+                    sync_status = "completed" if run["status"] == "completed" else \
+                                  "in_progress" if run["status"] in ("running", "starting") else \
+                                  "failed" if run["status"] in ("failed", "stalled") else None
+                    if sync_status:
+                        update_build_step_status(project_id, step["id"], sync_status)
+                    break
+    except Exception:
+        pass
+
+
+def _sync_run_to_build_step(project_path: Path, run: dict, new_status: str):
+    """Sync a run's status back to the corresponding build plan step in build-steps.json
+    AND the SQLite registry. Also sets latest_run_id FK."""
+    import re as _re
+
+    stub_name = run.get("stub_name", "")
+    if not stub_name:
+        return
+
+    # Extract step ID hint from stub name (e.g. "BP-02-data_models" → "data_models")
+    step_hint = _re.sub(r"^BP-\d+-", "", stub_name, flags=_re.IGNORECASE).lower()
+    run_id = run.get("id", "")
+    project_id = None
+
+    # Get project_id from run
+    if run_id:
+        from registry import get_run
+        db_run = get_run(run_id)
+        if db_run:
+            project_id = db_run.get("project_id")
+
+    # ── Update SQLite registry ──
+    if project_id:
+        from registry import get_build_steps
+        try:
+            steps_data = get_build_steps(project_id)
+            for step in steps_data.get("steps", []):
+                step_key = step["id"].lower().replace("_", "").replace("-", "")
+                hint_key = step_hint.replace("_", "").replace("-", "")
+                if hint_key in step_key or step_key in hint_key:
+                    from registry import update_build_step_status, link_build_step_to_run
+                    update_build_step_status(project_id, step["id"], new_status)
+                    if run_id:
+                        link_build_step_to_run(project_id, step["id"], run_id)
+                    break
+        except Exception:
+            pass
+
+    # ── Also update JSON file (backward compat) ──
+    steps_path = project_path / ".harness" / "build-steps.json"
+    if not steps_path.exists():
+        return
+
+    try:
+        steps = _json.loads(steps_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    updated = False
+    for step in steps:
+        step_key = step["id"].lower().replace("_", "").replace("-", "")
+        hint_key = step_hint.replace("_", "").replace("-", "")
+        if hint_key in step_key or step_key in hint_key:
+            step["status"] = new_status
+            updated = True
+            break
+
+    if updated:
+        steps_path.write_text(_json.dumps(steps, indent=2))
+
+
+def _save_run_log(runs_dir: Path, run: dict):
+    """Write a human-readable log file for a completed/failed run."""
+    run_id = run.get("id", "unknown")
+    log_path = runs_dir / f"run-{run_id}.log"
+    lines = []
+    lines.append(f"=== Run {run_id} ===")
+    lines.append(f"Stub:     {run.get('stub_name', '?')}")
+    lines.append(f"Agent:    {run.get('agent', '?')}")
+    lines.append(f"Model:    {run.get('model', '?')}")
+    lines.append(f"Status:   {run.get('status', '?')}")
+    lines.append(f"Exit:     {run.get('exit_code', '?')}")
+    lines.append(f"Error:    {run.get('error', '—')}")
+    lines.append(f"Start:    {run.get('start_time', '?')}")
+    lines.append(f"End:      {run.get('end_time', '?')}")
+    lines.append(f"BP:       {run.get('bp_id', '—')}")
+    lines.append(f"Title:    {run.get('title', '—')}")
+    lines.append("")
+    lines.append("--- Events ---")
+    for ev in run.get("events", []):
+        ts = ev.get("timestamp", "?")[11:19] if len(ev.get("timestamp", "")) > 19 else ev.get("timestamp", "?")
+        lines.append(f"  [{ts}] {ev.get('level', 'info').upper():5s} {ev.get('message', '')}")
+    lines.append("")
+    lines.append("--- Output Preview ---")
+    preview = run.get("output_preview", "")
+    if preview:
+        lines.append(preview[:2000])
+    else:
+        lines.append("(no output captured)")
+    lines.append("")
+    lines.append("--- Files Changed ---")
+    files = run.get("files_changed", [])
+    if files:
+        for f in files:
+            lines.append(f"  {f.get('status', '?')}: {f.get('path', '?')}")
+    else:
+        lines.append("(none)")
+    log_path.write_text("\n".join(lines))
+
+
+@router.post("/api/projects/{project_id}/build-plan/run-script")
+def run_coding_script(project_id: str, script_name: str = Body(..., embed=True)):
+    """Quick run without tracking (legacy). Use /start-run for tracked runs."""
+    return start_tracked_run(project_id, stub_name=script_name, agent="opencode")
 
 
 @router.post("/api/projects/{project_id}/preview-mspec")
@@ -2806,6 +4385,201 @@ def confirm_context(project_id: str, data: dict = Body(...)):
         "committed": committed,
         "commit_hash": commit_hash,
     }
+
+
+@router.get("/api/projects/{project_id}/analytics/runs")
+def run_analytics(project_id: str):
+    """Return run analytics: success rates per stub, failure themes, recent runs.
+
+    Groups failure messages into themes and surfaces the top 5 most common
+    root causes across all failed/stalled runs.
+    """
+    import re as _re
+    from collections import Counter
+
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Get all runs
+    runs_result = db_list_runs(project_id)
+    all_runs = runs_result.get("runs", [])
+
+    total = len(all_runs)
+    completed = sum(1 for r in all_runs if r["status"] == "completed")
+    failed = sum(1 for r in all_runs if r["status"] in ("failed", "stalled"))
+    running_count = sum(1 for r in all_runs if r["status"] in ("starting", "running"))
+
+    # Per-stub breakdown
+    by_stub = {}
+    for r in all_runs:
+        stub = r.get("stub_name", "unknown")
+        if stub not in by_stub:
+            by_stub[stub] = {"completed": 0, "failed": 0, "total": 0, "total_duration_s": 0, "count_with_duration": 0}
+        by_stub[stub]["total"] += 1
+        if r["status"] == "completed":
+            by_stub[stub]["completed"] += 1
+        elif r["status"] in ("failed", "stalled"):
+            by_stub[stub]["failed"] += 1
+        # Duration
+        start = r.get("start_time")
+        end = r.get("end_time")
+        if start and end:
+            try:
+                st = _dt.datetime.fromisoformat(str(start))
+                et = _dt.datetime.fromisoformat(str(end))
+                by_stub[stub]["total_duration_s"] += (et - st).total_seconds()
+                by_stub[stub]["count_with_duration"] += 1
+            except Exception:
+                pass
+
+    stub_list = []
+    for stub, counts in sorted(by_stub.items(), key=lambda x: x[1]["total"], reverse=True):
+        rate = round(counts["completed"] / counts["total"] * 100) if counts["total"] > 0 else 0
+        avg_dur = round(counts["total_duration_s"] / counts["count_with_duration"]) if counts["count_with_duration"] > 0 else None
+        stub_list.append({
+            "stub_name": stub,
+            "total": counts["total"],
+            "completed": counts["completed"],
+            "failed": counts["failed"],
+            "success_rate": rate,
+            "avg_duration_s": avg_dur,
+        })
+
+    # Failure themes: cluster error messages into themes
+    error_messages = []
+    no_error_count = 0
+    for r in all_runs:
+        if r["status"] in ("failed", "stalled"):
+            err = r.get("error") or ""
+            if err:
+                error_messages.append((r["id"], r["stub_name"], err))
+            else:
+                no_error_count += 1
+
+    # Theme categories and their keyword patterns
+    THEME_PATTERNS = [
+        ("Stall / Timeout", [r"stall", r"timeout", r"abandoned", r"no PID", r"without progress", r"Stall limit"]),
+        ("Process Crash / Exit Code", [r"exit code [1-9]", r"process.*terminated", r"died unexpectedly", r"process \d+ terminated"]),
+        ("Configuration / Path", [r"not found", r"no module", r"ModuleNotFoundError", r"No such file", r"cannot access", r"not defined"]),
+        ("API / Network", [r"connection", r"timeout", r"ECONNREFUSED", r"401", r"403", r"500", r"HTTP"]),
+        ("Code Error / Syntax", [r"SyntaxError", r"ImportError", r"AttributeError", r"TypeError", r"cannot import"]),
+        ("Agent / Model Issue", [r"agent", r"model", r"LLM", r"token", r"rate limit", r"provider"]),
+        ("Git / Filesystem", [r"git", r"commit", r"permission denied", r"read-only", r"cannot write"]),
+    ]
+
+    themes = []
+    matched_ids = set()
+    for theme_name, patterns in THEME_PATTERNS:
+        theme_errors = []
+        for rid, stub, err in error_messages:
+            for pat in patterns:
+                if _re.search(pat, err, _re.IGNORECASE):
+                    theme_errors.append({"run_id": rid, "stub_name": stub, "error": err[:200]})
+                    matched_ids.add(rid)
+                    break
+        if theme_errors:
+            themes.append({
+                "theme": theme_name,
+                "count": len(theme_errors),
+                "examples": theme_errors[:3],
+                "affected_stubs": list(set(e["stub_name"] for e in theme_errors)),
+            })
+
+    # Add theme for runs with no error captured
+    if no_error_count > 0:
+        unknown_stubs = list(set(
+            r.get("stub_name", "?")
+            for r in all_runs
+            if r["status"] in ("failed", "stalled") and not r.get("error")
+        ))
+        themes.append({
+            "theme": "Unknown (no error captured)",
+            "count": no_error_count,
+            "examples": [{"run_id": "", "stub_name": unknown_stubs[0] if unknown_stubs else "?",
+                          "error": "No error text recorded — failure predates error capture. Re-run the blueprint to populate error diagnostics."}],
+            "affected_stubs": unknown_stubs[:5],
+        })
+
+    # Sort by count descending
+    themes.sort(key=lambda t: t["count"], reverse=True)
+
+    # Recent runs (last 10)
+    recent = sorted(all_runs, key=lambda r: r.get("start_time", ""), reverse=True)[:10]
+    recent_light = []
+    for r in recent:
+        recent_light.append({
+            "id": r["id"],
+            "stub_name": r.get("stub_name", ""),
+            "agent": r.get("agent", ""),
+            "status": r["status"],
+            "error": (r.get("error") or "")[:120],
+            "start_time": r.get("start_time"),
+            "end_time": r.get("end_time"),
+            "exit_code": r.get("exit_code"),
+        })
+
+    return {
+        "summary": {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "running": running_count,
+            "success_rate": round(completed / total * 100) if total > 0 else 0,
+        },
+        "by_stub": stub_list,
+        "failure_themes": themes[:5],
+        "recent_runs": recent_light,
+    }
+
+
+@router.get("/api/projects/{project_id}/context-file")
+def get_context_file(project_id: str):
+    """Return the project's context markdown file content.
+
+    Checks .harness/context.md first, falls back to .harness/mspec.md.
+    Returns {exists, content, path} so the frontend can decide
+    whether to show the context editor or the setup wizard.
+    """
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    project_path = Path(project["path"])
+    candidates = [
+        project_path / ".harness" / "context.md",
+        project_path / ".harness" / "mspec.md",
+    ]
+
+    for cand in candidates:
+        if cand.exists():
+            return {
+                "exists": True,
+                "content": cand.read_text(encoding="utf-8"),
+                "path": str(cand.relative_to(project_path)),
+            }
+
+    return {
+        "exists": False,
+        "content": None,
+        "path": ".harness/context.md",
+    }
+
+
+@router.get("/api/projects/{project_id}/dashboard-summary")
+def dashboard_summary(project_id: str):
+    """Unified endpoint returning all dashboard data from a single DB query.
+
+    Returns project info, build steps (with run FK links), run counts,
+    and recent runs — all consistently sourced from the SQLite registry.
+    """
+    _ensure_db()
+    project = get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return get_dashboard_summary(project_id)
 
 
 @router.get("/health")

@@ -241,5 +241,125 @@ def agent(
         console.print(f"[yellow]Agent config update not yet persistent. (future)[/yellow]")
 
 
+@app.command(name="reasonix-run")
+def reasonix_run(
+    stub: str | None = typer.Argument(None, help="Path to stub .md file (e.g. src/stubs/BP-01-scaffold.md)"),
+    list_stubs: bool = typer.Option(False, "--list", "-l", help="List available blueprint stubs"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print task text without executing"),
+    project_dir: str | None = typer.Option(None, "--dir", "-d", help="Working directory for Reasonix (default: current dir)"),
+    timeout: int = typer.Option(300, "--timeout", "-t", help="Timeout in seconds for Reasonix execution"),
+):
+    """Read a stub file and pass it to Reasonix for autonomous execution.
+
+    Stub files are self-contained markdown blueprints with YAML frontmatter.
+    They describe a task with full context, spec, and acceptance criteria,
+    designed to be passed to reasonix for autonomous execution.
+
+    Examples:
+
+        # List available stubs
+        harness reasonix-run --list
+
+        # Dry-run with BP-01 scaffold blueprint
+        harness reasonix-run src/stubs/BP-01-scaffold.md --dry-run
+
+        # Execute stub autonomously via Reasonix
+        harness reasonix-run src/stubs/BP-01-scaffold.md
+
+    Requires `reasonix` CLI installed globally: npm install -g reasonix
+    """
+    if list_stubs:
+        from stubs.runner import list_stubs as _list_stubs
+        stubs = _list_stubs()
+        if not stubs:
+            console.print("[yellow]No stub files found in src/stubs/[/yellow]")
+            return
+        table = Table(title="Available Blueprint Stubs")
+        table.add_column("BP", style="cyan")
+        table.add_column("Name", style="green")
+        table.add_column("Title", style="white")
+        table.add_column("Init", justify="center")
+        for s in stubs:
+            table.add_row(s["bp"], s["name"], s["title"], "✓" if s["init"] else "")
+        console.print(table)
+        return
+
+    if not stub:
+        console.print("[red]No stub file specified. Use --list to see available stubs.[/red]")
+        raise typer.Exit(1)
+
+    stub_path = Path(stub).expanduser()
+    if not stub_path.exists():
+        # Try relative to stubs dir
+        alt_path = Path(__file__).parent / "stubs" / stub
+        if alt_path.exists():
+            stub_path = alt_path
+        # Try with .md extension
+        elif not stub.endswith(".md"):
+            with_md = stub_path.with_suffix(".md")
+            if with_md.exists():
+                stub_path = with_md
+            else:
+                alt_with_md = Path(__file__).parent / "stubs" / (stub + ".md")
+                if alt_with_md.exists():
+                    stub_path = alt_with_md
+                else:
+                    console.print(f"[red]Stub file not found: {stub}[/red]")
+                    console.print("[yellow]Use --list to see available stubs[/yellow]")
+                    raise typer.Exit(1)
+
+    console.print(f"[bold]Reading stub:[/bold] {stub_path.name}")
+
+    from stubs.runner import run_stub, parse_stub
+
+    try:
+        # Quick parse to show summary
+        parsed = parse_stub(stub_path)
+        fm = parsed["frontmatter"]
+        console.print(f"  BP: {fm.get('bp', '—')}")
+        console.print(f"  Title: {fm.get('title', stub_path.stem)}")
+        console.print(f"  Init project: {'yes' if fm.get('init') else 'no'}")
+        console.print(f"  Body: {len(parsed['body'])} chars")
+        console.print("")
+
+        cwd = Path(project_dir).expanduser() if project_dir else None
+
+        result = run_stub(
+            stub_path=stub_path,
+            project_dir=cwd,
+            dry_run=dry_run,
+            timeout_sec=timeout,
+        )
+
+        if result["action"] == "dry_run":
+            console.print("[yellow]Dry-run mode — task would be passed to Reasonix:[/yellow]")
+            if result.get("task_text"):
+                console.print(Panel(result["task_text"][:2000], title="Task Preview"))
+        elif result["action"] == "error":
+            console.print(f"[red]Error: {result.get('error', 'Unknown error')}[/red]")
+            console.print("[yellow]Install Reasonix: npm install -g reasonix[/yellow]")
+            raise typer.Exit(1)
+        elif result["action"] == "executed":
+            console.print(Panel(
+                f"BP: {result['stub']['bp']}\n"
+                f"Title: {result['stub']['title']}\n"
+                f"Command: {result['command']}\n"
+                f"Exit code: {result['returncode']}",
+                title="Execution Complete",
+            ))
+            if result["stdout"]:
+                console.print("[bold]Output:[/bold]")
+                console.print(result["stdout"][:2000])
+            if result["stderr"]:
+                console.print("[dim]Stderr:[/dim]")
+                console.print(result["stderr"][:500])
+        elif result["action"] == "timeout":
+            console.print(f"[red]Timed out after {timeout}s[/red]")
+
+    except Exception as e:
+        console.print(f"[red]Error running stub: {e}[/red]")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

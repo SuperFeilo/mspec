@@ -1,0 +1,41 @@
+{
+  "runs": [
+    {
+      "timestamp": "2026-05-26T15:31:44.211233+00:00",
+      "stub_name": "scaffold",
+      "stub_bp": "BP-01",
+      "predicted_oneshot_rate": 85,
+      "validation_score": 55,
+      "actual_outcome": "success",
+      "reason": "AI produced file output with paths",
+      "intent": "code",
+      "exit_code": 0,
+      "output_preview": "```python ./src/requirements.txt\ntyper\npydantic\nrich\nhttpx\n```\n\n```python ./src/main.py\nimport typer\n\napp = typer.Typer()\n\n@app.command()\ndef hello():\n    print(\"Hello from scaffold!\")\n\nif __name__ =="
+    },
+    {
+      "timestamp": "2026-05-26T17:58:49.167098+00:00",
+      "stub_name": "scaffold",
+      "stub_bp": "BP-01",
+      "predicted_oneshot_rate": 15,
+      "validation_score": 0,
+      "actual_outcome": "success",
+      "reason": "AI produced file output",
+      "intent": "code",
+      "exit_code": 0,
+      "output_preview": "```python ./.harness/bp-01-scaffold/requirements.txt\nfastapi\nuvicorn\nsqlalchemy\npydantic\npython-dotenv\nalembic\n```\n\n```python ./.harness/bp-01-scaffold/main.py\n\"\"\"FastAPI application for scaffold proj"
+    },
+    {
+      "timestamp": "2026-05-26T18:16:43.918696+00:00",
+      "stub_name": "scaffold",
+      "stub_bp": "BP-01",
+      "predicted_oneshot_rate": 15,
+      "validation_score": 0,
+      "actual_outcome": "stall",
+      "reason": "AI produced 1000 chars without file output",
+      "intent": "code",
+      "exit_code": 0,
+      "output_preview": "```python .harness/bp-01-scaffold/requirements.txt\nfastapi uvicorn sqlalchemy pydantic python-dotenv alembic\n```\n\n```python .harness/bp-01-scaffold/main.py\n\"\"\"FastAPI application for scaffold project."
+    }
+  ],
+  "total": 3
+}

@@ -189,6 +189,18 @@ export default function ProjectContext() {
     queryFn: fetchProviderConfig,
   })
 
+  // Check if context file already exists
+  const { data: ctxFileRes, isLoading: ctxFileLoading } = useQuery({
+    queryKey: ['context-file', projectId],
+    queryFn: async () => {
+      const r = await fetch(`/api/projects/${projectId}/context-file`)
+      if (!r.ok) return { exists: false }
+      return r.json()
+    },
+  })
+
+  const [showWizard, setShowWizard] = useState(false)
+
   const readiness = flow?.readiness
 
   // Seed requirements from context flow
@@ -351,7 +363,30 @@ export default function ProjectContext() {
 
   // ── Render ──────────────────────────────────────────────
 
-  if (isLoading) return <div className="flex items-center gap-2 text-gray-400 py-16 justify-center"><Loader className="w-5 h-5 animate-spin" /> Loading...</div>
+  if (isLoading || ctxFileLoading) return <div className="flex items-center gap-2 text-gray-400 py-16 justify-center"><Loader className="w-5 h-5 animate-spin" /> Loading...</div>
+
+  // If context file exists and user hasn't opted to run the wizard, show it
+  if (ctxFileRes?.exists && !showWizard) {
+    return (
+      <div className="space-y-6 max-w-4xl mx-auto">
+        <div className="flex items-center gap-3">
+          <Link to={`/project/${projectId}`}><ArrowLeft className="w-5 h-5 text-gray-400 hover:text-gray-200" /></Link>
+          <div className="flex-1">
+            <h1 className="text-2xl font-bold">Project Context</h1>
+            <p className="text-xs text-gray-500 mt-0.5">{ctxFileRes.path}</p>
+          </div>
+          <button onClick={() => setShowWizard(true)}
+            className="flex items-center gap-1.5 text-xs text-cyan-400 hover:text-cyan-300 border border-gray-700 rounded px-3 py-1.5">
+            <Edit3 className="w-3.5 h-3.5" /> Re-run Wizard
+          </button>
+        </div>
+        <div className="bg-gray-900/50 border border-gray-800 rounded-xl p-6">
+          <pre className="text-sm text-gray-300 font-mono whitespace-pre-wrap leading-relaxed">{ctxFileRes.content}</pre>
+        </div>
+      </div>
+    )
+  }
+
   if (!readiness) return <div className="text-center py-16 text-gray-500">No context data.</div>
 
   return (
